@@ -20,6 +20,8 @@ Config:
     ORIGINAL_ACTION    — "deactivate" / "delete" / "none"
     PLANE_OFFSET       — Additional offset along FACE_NORMAL direction
     MIN_PANEL_EXTENT   — Minimum panel size along FACE_NORMAL axis (filters edge-on panels)
+    ORIENT_MAX_RATIO   — Skip panels where extent_along_normal > max(u,v) * ratio
+                         (filters perpendicular walls that don't face FACE_NORMAL)
 """
 
 import omni.usd
@@ -43,6 +45,7 @@ ORIGINAL_ACTION    = "deactivate"   # "deactivate" / "delete" / "none"
 PLANE_OFFSET       = 0.0
 WELD_TOLERANCE     = 1e-3
 MIN_PANEL_EXTENT   = 0.01  # panels thinner than this along FACE_NORMAL are skipped
+ORIENT_MAX_RATIO   = 1.0   # skip if extent_along_normal > max(u,v) * this ratio
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NORMALS = {
@@ -183,13 +186,20 @@ def run():
         bboxes       = []
         valid_meshes = []
         skipped      = 0
+        skipped_orient = 0
         for m in panel_meshes:
             mn, mx = _get_world_bbox(m)
             if mn is None:
                 continue
-            extent_along_normal = float(mx[axis_idx] - mn[axis_idx])
-            if extent_along_normal < MIN_PANEL_EXTENT:
+            extent_n = float(mx[axis_idx] - mn[axis_idx])
+            extent_u = float(mx[u_idx]    - mn[u_idx])
+            extent_v = float(mx[v_idx]    - mn[v_idx])
+            if extent_n < MIN_PANEL_EXTENT:
                 skipped += 1
+                continue
+            max_uv = max(extent_u, extent_v)
+            if max_uv > 0 and extent_n > max_uv * ORIENT_MAX_RATIO:
+                skipped_orient += 1
                 continue
             bboxes.append((mn, mx))
             valid_meshes.append(m)
@@ -197,6 +207,9 @@ def run():
         if skipped:
             print(f"[MergeWallPanels] Skipped {skipped} edge-on panel(s) "
                   f"(extent < {MIN_PANEL_EXTENT})")
+        if skipped_orient:
+            print(f"[MergeWallPanels] Skipped {skipped_orient} perpendicular panel(s) "
+                  f"(not facing {FACE_NORMAL})")
 
         if not bboxes:
             print("[MergeWallPanels] No valid mesh data found.")
