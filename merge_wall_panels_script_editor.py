@@ -84,9 +84,11 @@ def _collect_panel_meshes(root_prim):
                 result.append(prim)
                 continue
             cur = prim.GetParent()
-            while cur and cur.IsValid() and cur.GetPath() != root_prim.GetPath():
+            while cur and cur.IsValid():
                 if _is_panel(cur):
                     result.append(prim)
+                    break
+                if cur.GetPath() == root_prim.GetPath():
                     break
                 cur = cur.GetParent()
     return result
