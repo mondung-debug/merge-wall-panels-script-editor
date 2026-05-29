@@ -1,27 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 Merge Wall Panels — Script Editor (BBox mode)
-Each panel's AABB U/V extents are projected onto a single shared plane
-at the global face position in the FACE_NORMAL direction.
-All quads are vertex-welded and triangulated into a single UsdGeom.Mesh.
-Holes are intentionally omitted — output is a solid wall plane.
+Each panel's AABB U/V extents are projected onto the inner face quad,
+then all quads are vertex-welded and triangulated into a single UsdGeom.Mesh.
+Holes are intentionally omitted — output is a solid wall surface.
 
 Usage:
     1. Select a component prim in USD Composer
-    2. Set FACE_NORMAL to match the wall's inward-facing direction
+    2. Set FACE_NORMAL (or leave "auto" to detect inner face automatically)
     3. Run script
 
 Config:
-    FACE_NORMAL        — "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
+    FACE_NORMAL        — "auto" / "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
+                         "auto": per-panel inner face detected via centroid
     FILTER_MODE        — "all_mesh" / "name" / "metadata"
     WALL_CATEGORIES    — Category values to match (FILTER_MODE="metadata")
     WALL_FAMILY_NAMES  — FamilyName values to match (FILTER_MODE="metadata")
     RESULT_PRIM_NAME   — Output mesh prim name
     ORIGINAL_ACTION    — "deactivate" / "delete" / "none"
-    PLANE_OFFSET       — Additional offset along FACE_NORMAL direction
-    MIN_PANEL_EXTENT   — Minimum panel size along FACE_NORMAL axis (filters edge-on panels)
-    ORIENT_MAX_RATIO   — Skip panels where extent_along_normal > max(u,v) * ratio
-                         (filters perpendicular walls that don't face FACE_NORMAL)
+    PLANE_OFFSET       — Offset along face normal direction (auto mode: inward)
+    MIN_PANEL_EXTENT   — Skip panels thinner than this on their thin axis
 """
 
 import omni.usd
@@ -29,7 +27,7 @@ import numpy as np
 from pxr import Usd, UsdGeom, Gf, Vt
 
 # ── Config ───────────────────────────────────────────────────────────────────
-FACE_NORMAL        = "X+"   # "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
+FACE_NORMAL        = "auto"  # "auto" / "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
 
 FILTER_MODE        = "metadata"
 
@@ -44,8 +42,7 @@ RESULT_PRIM_NAME   = "WallPlane_Merged"
 ORIGINAL_ACTION    = "deactivate"   # "deactivate" / "delete" / "none"
 PLANE_OFFSET       = 0.0
 WELD_TOLERANCE     = 1e-3
-MIN_PANEL_EXTENT   = 0.01  # panels thinner than this along FACE_NORMAL are skipped
-ORIENT_MAX_RATIO   = 1.0   # skip if extent_along_normal > max(u,v) * this ratio
+MIN_PANEL_EXTENT   = 0.01  # skip panels thinner than this on their thin axis
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NORMALS = {
@@ -155,12 +152,12 @@ def run():
     ctx   = omni.usd.get_context()
     stage = ctx.get_stage()
 
-    if FACE_NORMAL not in _NORMALS:
-        print(f"[MergeWallPanels] ERROR: Invalid FACE_NORMAL '{FACE_NORMAL}'. "
-              f"Use: {list(_NORMALS.keys())}")
-        return
+    auto_mode = (FACE_NORMAL == "auto")
 
-    axis_idx, u_idx, v_idx, sign = _NORMALS[FACE_NORMAL]
+    if not auto_mode and FACE_NORMAL not in _NORMALS:
+        print(f"[MergeWallPanels] ERROR: Invalid FACE_NORMAL '{FACE_NORMAL}'. "
+              f"Use: 'auto' or {list(_NORMALS.keys())}")
+        return
 
     selection = ctx.get_selection().get_selected_prim_paths()
     if not selection:
@@ -182,59 +179,99 @@ def run():
 
         print(f"[MergeWallPanels] Found {len(panel_meshes)} panel mesh(es)")
 
-        # Step 1: collect world AABBs, filter edge-on panels
+        # Step 1: collect world AABBs
         bboxes       = []
         valid_meshes = []
         skipped      = 0
-        skipped_orient = 0
-        for m in panel_meshes:
-            mn, mx = _get_world_bbox(m)
-            if mn is None:
-                continue
-            extent_n = float(mx[axis_idx] - mn[axis_idx])
-            extent_u = float(mx[u_idx]    - mn[u_idx])
-            extent_v = float(mx[v_idx]    - mn[v_idx])
-            if extent_n < MIN_PANEL_EXTENT:
-                skipped += 1
-                continue
-            max_uv = max(extent_u, extent_v)
-            if max_uv > 0 and extent_n > max_uv * ORIENT_MAX_RATIO:
-                skipped_orient += 1
-                continue
-            bboxes.append((mn, mx))
-            valid_meshes.append(m)
+
+        if auto_mode:
+            # In auto mode: detect thin axis per panel, no orientation filter needed
+            for m in panel_meshes:
+                mn, mx = _get_world_bbox(m)
+                if mn is None:
+                    continue
+                extents = mx - mn
+                thin_axis = int(np.argmin(extents))
+                if extents[thin_axis] < MIN_PANEL_EXTENT:
+                    skipped += 1
+                    continue
+                bboxes.append((mn, mx, thin_axis))
+                valid_meshes.append(m)
+        else:
+            axis_idx, u_idx, v_idx, sign = _NORMALS[FACE_NORMAL]
+            skipped_orient = 0
+            for m in panel_meshes:
+                mn, mx = _get_world_bbox(m)
+                if mn is None:
+                    continue
+                extent_n = float(mx[axis_idx] - mn[axis_idx])
+                extent_u = float(mx[u_idx]    - mn[u_idx])
+                extent_v = float(mx[v_idx]    - mn[v_idx])
+                if extent_n < MIN_PANEL_EXTENT:
+                    skipped += 1
+                    continue
+                max_uv = max(extent_u, extent_v)
+                if max_uv > 0 and extent_n > max_uv:
+                    skipped_orient += 1
+                    continue
+                bboxes.append((mn, mx, axis_idx))
+                valid_meshes.append(m)
+            if skipped_orient:
+                print(f"[MergeWallPanels] Skipped {skipped_orient} perpendicular panel(s) "
+                      f"(not facing {FACE_NORMAL})")
 
         if skipped:
-            print(f"[MergeWallPanels] Skipped {skipped} edge-on panel(s) "
-                  f"(extent < {MIN_PANEL_EXTENT})")
-        if skipped_orient:
-            print(f"[MergeWallPanels] Skipped {skipped_orient} perpendicular panel(s) "
-                  f"(not facing {FACE_NORMAL})")
+            print(f"[MergeWallPanels] Skipped {skipped} degenerate panel(s)")
 
         if not bboxes:
             print("[MergeWallPanels] No valid mesh data found.")
             continue
 
-        # Step 2: compute single shared face plane (global extreme along FACE_NORMAL)
-        all_mn = np.array([b[0] for b in bboxes])
-        all_mx = np.array([b[1] for b in bboxes])
-        if sign > 0:
-            global_face_val = float(all_mx[:, axis_idx].max())
+        # Step 2: build quads
+        if auto_mode:
+            # Compute centroid of all panel centers to determine inner face
+            centers = np.array([(mn + mx) / 2 for mn, mx, _ in bboxes])
+            centroid = centers.mean(axis=0)
+            print(f"[MergeWallPanels] Auto mode | centroid = "
+                  f"({centroid[0]:.2f}, {centroid[1]:.2f}, {centroid[2]:.2f})")
+
+            quads = []
+            for mn, mx, thin_axis in bboxes:
+                all_axes = [0, 1, 2]
+                all_axes.remove(thin_axis)
+                u_ax, v_ax = all_axes
+
+                panel_center = (mn + mx) / 2
+                # Inner face points toward centroid
+                if panel_center[thin_axis] < centroid[thin_axis]:
+                    # Panel is on the negative side → inner face at MAX
+                    sign_p = +1
+                    face_val = float(mx[thin_axis]) + PLANE_OFFSET
+                else:
+                    # Panel is on the positive side → inner face at MIN
+                    sign_p = -1
+                    face_val = float(mn[thin_axis]) - PLANE_OFFSET
+
+                quads.append(_build_face_quad(mn, mx, thin_axis, u_ax, v_ax, sign_p, face_val))
+
         else:
-            global_face_val = float(all_mn[:, axis_idx].min())
-        global_face_val += PLANE_OFFSET * sign
+            # Manual mode: project all quads onto single shared plane
+            all_mn = np.array([b[0] for b in bboxes])
+            all_mx = np.array([b[1] for b in bboxes])
+            if sign > 0:
+                global_face_val = float(all_mx[:, axis_idx].max()) + PLANE_OFFSET
+            else:
+                global_face_val = float(all_mn[:, axis_idx].min()) - PLANE_OFFSET
+            print(f"[MergeWallPanels] Shared plane at axis[{axis_idx}] = {global_face_val:.4f}")
 
-        print(f"[MergeWallPanels] Shared plane at axis[{axis_idx}] = {global_face_val:.4f}")
+            quads = [_build_face_quad(mn, mx, axis_idx, u_idx, v_idx, sign, global_face_val)
+                     for mn, mx, _ in bboxes]
 
-        # Step 3: build quads projected onto the shared plane
-        quads = [_build_face_quad(mn, mx, axis_idx, u_idx, v_idx, sign, global_face_val)
-                 for mn, mx in bboxes]
-
-        # Step 4: weld vertices
+        # Step 3: weld vertices
         merged_pts, global_mapping = _merge_vertices(quads)
         print(f"[MergeWallPanels] BBox quads: {len(quads)}, Welded vertices: {len(merged_pts)}")
 
-        # Step 5: triangulate each quad (2 triangles, CCW)
+        # Step 4: triangulate each quad (2 triangles, CCW)
         all_triangles = []
         for qi in range(len(quads)):
             base = qi * 4
@@ -247,14 +284,14 @@ def run():
 
         print(f"[MergeWallPanels] Triangles: {len(all_triangles)}")
 
-        # Step 6: compact vertices
+        # Step 5: compact vertices
         used_set   = sorted({v for tri in all_triangles for v in tri})
         vert_remap = {old: new for new, old in enumerate(used_set)}
         compact_pts   = merged_pts[used_set]
         remapped_tris = [(vert_remap[a], vert_remap[b], vert_remap[c])
                          for a, b, c in all_triangles]
 
-        # Step 7: create USD Mesh
+        # Step 6: create USD Mesh
         result_path = f"{root_path}/{RESULT_PRIM_NAME}"
         if stage.GetPrimAtPath(result_path):
             stage.RemovePrim(result_path)
