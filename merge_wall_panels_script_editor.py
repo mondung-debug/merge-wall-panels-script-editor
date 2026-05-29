@@ -1,62 +1,57 @@
 # -*- coding: utf-8 -*-
 """
-Merge Wall Panels — Script Editor
-Merges wall panel tiles into a single lightweight UsdGeom.Mesh by
-selecting faces whose normal matches FACE_NORMAL and triangulating them.
-Works with walls that have uneven depths (protrusions/recesses).
+Merge Wall Panels — Script Editor (BBox mode)
+Each panel's AABB U/V extents are projected onto a single shared plane
+at the global face position in the FACE_NORMAL direction.
+All quads are vertex-welded and triangulated into a single UsdGeom.Mesh.
+Holes are intentionally omitted — output is a solid wall plane.
 
 Usage:
     1. Select a component prim in USD Composer
-    2. Set FACE_NORMAL to match the wall's outward direction
+    2. Set FACE_NORMAL to match the wall's inward-facing direction
     3. Run script
 
 Config:
-    FACE_NORMAL        — Outward face direction: "Z+" "Z-" "X+" "X-" "Y+" "Y-"
-    NORMAL_THRESHOLD   — Dot product threshold for face selection (0.9 = within ~25 deg)
+    FACE_NORMAL        — "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
     FILTER_MODE        — "all_mesh" / "name" / "metadata"
+    WALL_CATEGORIES    — Category values to match (FILTER_MODE="metadata")
+    WALL_FAMILY_NAMES  — FamilyName values to match (FILTER_MODE="metadata")
     RESULT_PRIM_NAME   — Output mesh prim name
-    DEACTIVATE_ORIGINAL — Deactivate original panels after merge
-    OFFSET             — Offset along FACE_NORMAL direction (0 = original position)
+    ORIGINAL_ACTION    — "deactivate" / "delete" / "none"
+    PLANE_OFFSET       — Additional offset along FACE_NORMAL direction
+    MIN_PANEL_EXTENT   — Minimum panel size along FACE_NORMAL axis (filters edge-on panels)
 """
 
 import omni.usd
 import numpy as np
-from pxr import Usd, UsdGeom, Gf, Vt, Sdf
-from collections import defaultdict
+from pxr import Usd, UsdGeom, Gf, Vt
 
 # ── Config ───────────────────────────────────────────────────────────────────
-# FACE_NORMAL: outward direction of the surface to extract
-#   "Z+"  — ceiling/top face  (same as floor tiles but from above)
-#   "Z-"  — floor/bottom face
-#   "X+"  — wall facing +X
-#   "X-"  — wall facing -X
-#   "Y+"  — wall facing +Y
-#   "Y-"  — wall facing -Y
-FACE_NORMAL        = "X+"
+FACE_NORMAL        = "X+"   # "X+" / "X-" / "Y+" / "Y-" / "Z+" / "Z-"
 
-NORMAL_THRESHOLD   = 0.85   # min dot product with target normal (cos ~32 deg)
-FILTER_MODE        = "all_mesh"
+FILTER_MODE        = "metadata"
 
-FLOOR_CATEGORIES   = {"Walls", "Curtain Panels", "Curtain Wall Panels"}
-FLOOR_FAMILY_NAMES = {"Basic Wall", "System Panel", "Curtain Wall Panel"}
+WALL_CATEGORIES    = {"Curtain Panels", "Walls", "Floors"}
+WALL_FAMILY_NAMES  = {"System Panel", "Access Floor Panel", "Basic Wall", "Floor"}
 ATTR_CATEGORY      = "omni:hoops:metadata:Other:Category"
 ATTR_FAMILY_NAME   = "omni:hoops:metadata:Other:tn__FamilyName_mA"
 
 PANEL_MESH_NAMES   = {"polySurface1"}
 
 RESULT_PRIM_NAME   = "WallPlane_Merged"
-DEACTIVATE_ORIGINAL = True
-OFFSET             = 0.0    # offset along FACE_NORMAL direction
+ORIGINAL_ACTION    = "deactivate"   # "deactivate" / "delete" / "none"
+PLANE_OFFSET       = 0.0
 WELD_TOLERANCE     = 1e-3
+MIN_PANEL_EXTENT   = 0.01  # panels thinner than this along FACE_NORMAL are skipped
 # ─────────────────────────────────────────────────────────────────────────────
 
-_NORMAL_DIRECTIONS = {
-    "X+": np.array([ 1.0, 0.0, 0.0]),
-    "X-": np.array([-1.0, 0.0, 0.0]),
-    "Y+": np.array([ 0.0, 1.0, 0.0]),
-    "Y-": np.array([ 0.0,-1.0, 0.0]),
-    "Z+": np.array([ 0.0, 0.0, 1.0]),
-    "Z-": np.array([ 0.0, 0.0,-1.0]),
+_NORMALS = {
+    "X+": ( 0, 1, 2, +1),  # axis_idx, u_idx, v_idx, sign
+    "X-": ( 0, 1, 2, -1),
+    "Y+": ( 1, 0, 2, +1),
+    "Y-": ( 1, 0, 2, -1),
+    "Z+": ( 2, 0, 1, +1),
+    "Z-": ( 2, 0, 1, -1),
 }
 
 
@@ -71,7 +66,7 @@ def _get_attr(prim, attr_name):
 def _is_panel(prim):
     cat = _get_attr(prim, ATTR_CATEGORY)
     fam = _get_attr(prim, ATTR_FAMILY_NAME)
-    return (cat and cat in FLOOR_CATEGORIES) or (fam and fam in FLOOR_FAMILY_NAMES)
+    return (cat and cat in WALL_CATEGORIES) or (fam and fam in WALL_FAMILY_NAMES)
 
 
 def _collect_panel_meshes(root_prim):
@@ -97,22 +92,40 @@ def _collect_panel_meshes(root_prim):
     return result
 
 
-def _world_mesh(mesh_prim):
+def _get_world_bbox(mesh_prim):
+    """Return world AABB as (min_pt, max_pt) numpy arrays, or (None, None)."""
     mesh = UsdGeom.Mesh(mesh_prim)
     pts_attr = mesh.GetPointsAttr()
-    fvc_attr = mesh.GetFaceVertexCountsAttr()
-    fvi_attr = mesh.GetFaceVertexIndicesAttr()
-    if not (pts_attr and pts_attr.HasValue() and
-            fvc_attr and fvc_attr.HasValue() and
-            fvi_attr and fvi_attr.HasValue()):
-        return None, None, None
+    if not (pts_attr and pts_attr.HasValue()):
+        return None, None
+
     pts = np.array(pts_attr.Get(), dtype=np.float64)
-    fvc = list(fvc_attr.Get())
-    fvi = list(fvi_attr.Get())
     mat = UsdGeom.Xformable(mesh_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     m   = np.array(mat)
     pts = np.hstack([pts, np.ones((len(pts), 1))]) @ m   # USD row-vector convention
-    return pts[:, :3], fvc, fvi
+    pts = pts[:, :3]
+
+    return pts.min(axis=0), pts.max(axis=0)
+
+
+def _build_face_quad(mn, mx, axis_idx, u_idx, v_idx, sign, face_val):
+    """Build a CCW face quad at face_val using the panel's U/V AABB extents."""
+    u0, u1 = float(mn[u_idx]), float(mx[u_idx])
+    v0, v1 = float(mn[v_idx]), float(mx[v_idx])
+
+    def _pt(u, v):
+        p = [0.0, 0.0, 0.0]
+        p[axis_idx] = face_val
+        p[u_idx]    = u
+        p[v_idx]    = v
+        return p
+
+    if sign > 0:
+        quad = [_pt(u0, v0), _pt(u1, v0), _pt(u1, v1), _pt(u0, v1)]
+    else:
+        quad = [_pt(u1, v0), _pt(u0, v0), _pt(u0, v1), _pt(u1, v1)]
+
+    return np.array(quad, dtype=np.float64)
 
 
 def _merge_vertices(pts_list, tol=WELD_TOLERANCE):
@@ -131,120 +144,18 @@ def _merge_vertices(pts_list, tol=WELD_TOLERANCE):
     return np.array(unique), mapping
 
 
-def _face_normal(pts, face_verts):
-    """Compute unit face normal using Newell's method (robust for N-gons)."""
-    n = np.zeros(3)
-    nv = len(face_verts)
-    for i in range(nv):
-        cur = pts[face_verts[i]]
-        nxt = pts[face_verts[(i + 1) % nv]]
-        n[0] += (cur[1] - nxt[1]) * (cur[2] + nxt[2])
-        n[1] += (cur[2] - nxt[2]) * (cur[0] + nxt[0])
-        n[2] += (cur[0] - nxt[0]) * (cur[1] + nxt[1])
-    length = np.linalg.norm(n)
-    if length < 1e-10:
-        return np.zeros(3)
-    return n / length
-
-
-def _project_to_2d(pts3d, face_normal_key):
-    """Project 3D points to 2D plane perpendicular to FACE_NORMAL."""
-    ax = face_normal_key[0]  # 'X', 'Y', or 'Z'
-    if ax == "X":
-        return pts3d[:, [1, 2]]   # YZ plane
-    elif ax == "Y":
-        return pts3d[:, [0, 2]]   # XZ plane
-    else:
-        return pts3d[:, [0, 1]]   # XY plane
-
-
-def _ray_cast_2d(pt, poly_pts):
-    x, y = float(pt[0]), float(pt[1])
-    inside = False
-    n = len(poly_pts)
-    j = n - 1
-    for i in range(n):
-        xi, yi = float(poly_pts[i][0]), float(poly_pts[i][1])
-        xj, yj = float(poly_pts[j][0]), float(poly_pts[j][1])
-        if (yi > y) != (yj > y):
-            denom = yj - yi
-            if abs(denom) > 1e-300 and x < (xj - xi) * (y - yi) / denom + xi:
-                inside = not inside
-        j = i
-    return inside
-
-
-def _triangulate_delaunay(face_global, pts2d):
-    """Delaunay triangulation filtered by point-in-polygon."""
-    try:
-        from scipy.spatial import Delaunay as _Delaunay
-    except ImportError:
-        return []
-    if len(face_global) < 3:
-        return []
-    local_pts = pts2d[face_global]
-    try:
-        tri = _Delaunay(local_pts)
-    except Exception:
-        return []
-    result = []
-    for simp in tri.simplices:
-        centroid = local_pts[simp].mean(axis=0)
-        if _ray_cast_2d(centroid, local_pts):
-            result.append((face_global[simp[0]], face_global[simp[1]], face_global[simp[2]]))
-    return result
-
-
-def _triangulate_target_faces(meshes_data, global_mapping, offset_list,
-                               pts2d, target_normal, threshold):
-    """Select faces whose normal aligns with target_normal, then triangulate."""
-    all_triangles = []
-    face_count = 0
-
-    for (pts_w, fvc, fvi), off in zip(meshes_data, offset_list):
-        if pts_w is None:
-            continue
-
-        vi_idx = 0
-        for fc in fvc:
-            face_local = [fvi[vi_idx + k] for k in range(fc)]
-
-            if fc >= 3:
-                n = _face_normal(pts_w, face_local)
-                if np.dot(n, target_normal) >= threshold:
-                    face_global = [global_mapping[off + v] for v in face_local]
-                    face_count += 1
-
-                    if fc == 3:
-                        all_triangles.append(tuple(face_global))
-                    elif fc == 4:
-                        all_triangles.append((face_global[0], face_global[1], face_global[2]))
-                        all_triangles.append((face_global[0], face_global[2], face_global[3]))
-                    else:
-                        tris = _triangulate_delaunay(face_global, pts2d)
-                        if not tris:
-                            tris = [(face_global[0], face_global[i], face_global[i+1])
-                                    for i in range(1, fc - 1)]
-                        all_triangles.extend(tris)
-
-            vi_idx += fc
-
-    print(f"[MergeWallPanels] Target faces found: {face_count}")
-    return all_triangles
-
-
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run():
     ctx   = omni.usd.get_context()
     stage = ctx.get_stage()
 
-    if FACE_NORMAL not in _NORMAL_DIRECTIONS:
+    if FACE_NORMAL not in _NORMALS:
         print(f"[MergeWallPanels] ERROR: Invalid FACE_NORMAL '{FACE_NORMAL}'. "
-              f"Use one of: {list(_NORMAL_DIRECTIONS.keys())}")
+              f"Use: {list(_NORMALS.keys())}")
         return
 
-    target_normal = _NORMAL_DIRECTIONS[FACE_NORMAL]
+    axis_idx, u_idx, v_idx, sign = _NORMALS[FACE_NORMAL]
 
     selection = ctx.get_selection().get_selected_prim_paths()
     if not selection:
@@ -257,8 +168,7 @@ def run():
             print(f"[MergeWallPanels] Invalid prim: {root_path}")
             continue
 
-        print(f"[MergeWallPanels] Processing: {root_path}")
-        print(f"[MergeWallPanels] Target face normal: {FACE_NORMAL}")
+        print(f"[MergeWallPanels] Processing: {root_path} | FACE_NORMAL={FACE_NORMAL}")
 
         panel_meshes = _collect_panel_meshes(root_prim)
         if not panel_meshes:
@@ -267,57 +177,76 @@ def run():
 
         print(f"[MergeWallPanels] Found {len(panel_meshes)} panel mesh(es)")
 
-        meshes_data = [_world_mesh(m) for m in panel_meshes]
+        # Step 1: collect world AABBs, filter edge-on panels
+        bboxes       = []
+        valid_meshes = []
+        skipped      = 0
+        for m in panel_meshes:
+            mn, mx = _get_world_bbox(m)
+            if mn is None:
+                continue
+            extent_along_normal = float(mx[axis_idx] - mn[axis_idx])
+            if extent_along_normal < MIN_PANEL_EXTENT:
+                skipped += 1
+                continue
+            bboxes.append((mn, mx))
+            valid_meshes.append(m)
 
-        valid_pts = [d[0] for d in meshes_data if d[0] is not None]
-        if not valid_pts:
+        if skipped:
+            print(f"[MergeWallPanels] Skipped {skipped} edge-on panel(s) "
+                  f"(extent < {MIN_PANEL_EXTENT})")
+
+        if not bboxes:
             print("[MergeWallPanels] No valid mesh data found.")
             continue
 
-        merged_pts, global_mapping = _merge_vertices(valid_pts)
-        print(f"[MergeWallPanels] Merged vertices: {len(merged_pts)}")
+        # Step 2: compute single shared face plane (global extreme along FACE_NORMAL)
+        all_mn = np.array([b[0] for b in bboxes])
+        all_mx = np.array([b[1] for b in bboxes])
+        if sign > 0:
+            global_face_val = float(all_mx[:, axis_idx].max())
+        else:
+            global_face_val = float(all_mn[:, axis_idx].min())
+        global_face_val += PLANE_OFFSET * sign
 
-        offsets = []
-        off = 0
-        for d in meshes_data:
-            offsets.append(off)
-            if d[0] is not None:
-                off += len(d[0])
+        print(f"[MergeWallPanels] Shared plane at axis[{axis_idx}] = {global_face_val:.4f}")
 
-        # Project to 2D plane perpendicular to FACE_NORMAL
-        pts2d = _project_to_2d(merged_pts, FACE_NORMAL)
+        # Step 3: build quads projected onto the shared plane
+        quads = [_build_face_quad(mn, mx, axis_idx, u_idx, v_idx, sign, global_face_val)
+                 for mn, mx in bboxes]
 
-        all_triangles = _triangulate_target_faces(
-            meshes_data, global_mapping, offsets,
-            pts2d, target_normal, NORMAL_THRESHOLD)
+        # Step 4: weld vertices
+        merged_pts, global_mapping = _merge_vertices(quads)
+        print(f"[MergeWallPanels] BBox quads: {len(quads)}, Welded vertices: {len(merged_pts)}")
 
-        if not all_triangles:
-            print(f"[MergeWallPanels] ERROR: No triangles produced. "
-                  f"Check FACE_NORMAL='{FACE_NORMAL}' or NORMAL_THRESHOLD={NORMAL_THRESHOLD}.")
-            continue
+        # Step 5: triangulate each quad (2 triangles, CCW)
+        all_triangles = []
+        for qi in range(len(quads)):
+            base = qi * 4
+            v0 = int(global_mapping[base + 0])
+            v1 = int(global_mapping[base + 1])
+            v2 = int(global_mapping[base + 2])
+            v3 = int(global_mapping[base + 3])
+            all_triangles.append((v0, v1, v2))
+            all_triangles.append((v0, v2, v3))
 
         print(f"[MergeWallPanels] Triangles: {len(all_triangles)}")
 
-        # Compact: only include vertices referenced by triangles
+        # Step 6: compact vertices
         used_set   = sorted({v for tri in all_triangles for v in tri})
         vert_remap = {old: new for new, old in enumerate(used_set)}
-        compact_pts = merged_pts[used_set]
+        compact_pts   = merged_pts[used_set]
         remapped_tris = [(vert_remap[a], vert_remap[b], vert_remap[c])
                          for a, b, c in all_triangles]
 
-        # Apply offset along FACE_NORMAL
-        pts3d_result = compact_pts.copy()
-        if OFFSET != 0.0:
-            pts3d_result += target_normal * OFFSET
-
-        # Create USD Mesh
+        # Step 7: create USD Mesh
         result_path = f"{root_path}/{RESULT_PRIM_NAME}"
         if stage.GetPrimAtPath(result_path):
             stage.RemovePrim(result_path)
 
         result_mesh = UsdGeom.Mesh.Define(stage, result_path)
         result_mesh.GetPointsAttr().Set(
-            Vt.Vec3fArray([Gf.Vec3f(*p) for p in pts3d_result]))
+            Vt.Vec3fArray([Gf.Vec3f(*p) for p in compact_pts]))
         result_mesh.GetFaceVertexCountsAttr().Set(
             Vt.IntArray([3] * len(remapped_tris)))
         result_mesh.GetFaceVertexIndicesAttr().Set(
@@ -325,18 +254,24 @@ def run():
         result_mesh.GetSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
         result_mesh.CreateDoubleSidedAttr().Set(True)
 
-        lo = Gf.Vec3f(*pts3d_result.min(axis=0))
-        hi = Gf.Vec3f(*pts3d_result.max(axis=0))
+        lo = Gf.Vec3f(*compact_pts.min(axis=0))
+        hi = Gf.Vec3f(*compact_pts.max(axis=0))
         result_mesh.GetExtentAttr().Set(Vt.Vec3fArray([lo, hi]))
 
-        if DEACTIVATE_ORIGINAL:
-            for m in panel_meshes:
+        if ORIGINAL_ACTION == "deactivate":
+            for m in valid_meshes:
                 m.SetActive(False)
-            print(f"[MergeWallPanels] Deactivated {len(panel_meshes)} original panel(s)")
+            print(f"[MergeWallPanels] Deactivated {len(valid_meshes)} original panel(s)")
+        elif ORIGINAL_ACTION == "delete":
+            for m in valid_meshes:
+                stage.RemovePrim(m.GetPath())
+            print(f"[MergeWallPanels] Deleted {len(valid_meshes)} original panel(s)")
+        else:
+            print(f"[MergeWallPanels] Original panels unchanged (ORIGINAL_ACTION='none')")
 
         stage.GetRootLayer().Save()
         print(f"[MergeWallPanels] Done -> {result_path}")
-        print(f"  Vertices: {len(pts3d_result)}, Triangles: {len(remapped_tris)}")
+        print(f"  Vertices: {len(compact_pts)}, Triangles: {len(remapped_tris)}")
 
 
 run()
